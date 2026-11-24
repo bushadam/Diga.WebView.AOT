@@ -19,7 +19,6 @@ internal sealed class MainWindow : Window
             <ul style="font-size:17px;line-height:1.9;margin-top:16px">
               <li>控件：<code>AvaloniaWebView</code>（NativeControlHost + WebView2Control）</li>
               <li>渲染：SimdSkia（纯托管 C# Skia）</li>
-              <li>中文渲染：档案数字化流程与质量管控系统</li>
             </ul>
             <div id="t" style="margin-top:22px;font-size:15px;color:#9fe6b0"></div>
           </div>
