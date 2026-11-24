@@ -95,3 +95,11 @@ Implementation notes:
 - **Focus**: keyboard focus is forwarded on pointer press (`FocusWebView()`); Tab traversal between
   Avalonia controls and the web content has to be wired by the host application.
 - One `AvaloniaWebView` = one `CoreWebView2Controller` = one browser process group (memory cost per tab).
+## Renderer caveats (SimdSkia)
+
+- The **SimdSkia** backend cannot synthesize bold/italic faces and throws
+  `System.NotSupportedException: Synthetic bold/italic font outlines are not implemented`
+  when a `TextBlock` requests a weight the installed font family does not provide
+  (e.g. `FontWeight="SemiBold"` on a family with only Regular/Bold).
+  Use a font family that really ships the requested face, or avoid non-default weights.
+- This concerns Avalonia-drawn chrome only; WebView2 renders itself and is unaffected.
