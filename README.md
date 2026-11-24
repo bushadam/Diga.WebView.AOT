@@ -20,6 +20,23 @@ We plan to integrate as much of Diga.WebView2 into this project as possible. How
 
 - [TestWindow](TestWindow/README.md) => CoreWindowsWrapper basied WebBrowser APP with Diga.NativeControls.WebBrowser.AOT
 - [MinimalWinForms](MinimalWinForms/README.md) => Minimal Windows Forms APP with Diga.WebView2.Wrapper.AOT
+- [Diga.WebView2.Avalonia](Diga.WebView2.Avalonia/README.md) => Avalonia 12 host control (`AvaloniaWebView`), AOT + SimdSkia friendly
+- [TestAvalonia](TestAvalonia/README.md) => Minimal Avalonia 12 APP (SimdSkia renderer) with Native AOT
+
+## Avalonia host (fork addition)
+
+This fork adds a framework-agnostic Avalonia host. It needs no WinForms/WPF:
+
+```csharp
+var webView = new AvaloniaWebView { Source = "https://www.bing.com" };
+webView.WebViewCreated += (_, _) => { /* ready */ };
+```
+
+Requirements: `app.manifest` with `supportedOS` (otherwise `NativeControlHost` throws),
+PerMonitorV2 DPI awareness, and `lib\Diga.WebView2.Native.dll` next to the executable.
+Verified with `SimdSkia.Avalonia` (pure managed renderer) and Native AOT:
+single-file exe ≈ 19 MB, no native Skia dependency.
+
 
 
 

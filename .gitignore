@@ -33,3 +33,13 @@
 /packages
 /TestWindow/bin/x64/Release/net10.0/win-x64
 /Diga.NativeControls.WebBrowser/bin/x64/Release/net10.0
+
+################################################################################
+# Fork additions: Avalonia host + sample (build output must never be committed)
+################################################################################
+/Diga.WebView2.Avalonia/bin/
+/Diga.WebView2.Avalonia/obj/
+/TestAvalonia/bin/
+/TestAvalonia/obj/
+/TestAvalonia/publish/
+/TestAvalonia/publish.log
