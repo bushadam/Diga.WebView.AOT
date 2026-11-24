@@ -1,4 +1,4 @@
-﻿using Diga.WebView2.Interop;
+using Diga.WebView2.Interop;
 using Diga.WebView2.Wrapper.EventArguments;
 using Diga.WebView2.Wrapper.shim;
 using Diga.WebView2.Wrapper.Types;
@@ -65,6 +65,35 @@ namespace Diga.WebView2.Wrapper
         private WebView2Settings Settings { get; set; }
         private WebView2CompositionController CompositionController { get; set; }
         public CookieManager GetCookieManager => this.WebView.CookieManager;
+
+        /// <summary>
+        /// 页面缩放比例。控制器尚未创建时读写返回 1.0 / 忽略写入。
+        /// 供非 WinForms 宿主（如 Avalonia 控件）直接使用。
+        /// </summary>
+        public double ZoomFactor
+        {
+            get => this.Controller == null ? 1.0 : this.Controller.ZoomFactor;
+            set
+            {
+                if (this.Controller != null)
+                {
+                    this.Controller.ZoomFactor = value;
+                }
+            }
+        }
+
+        /// <summary>把键盘焦点移入 WebView2（宿主控件被点击/激活时调用）。</summary>
+        public void MoveFocusToWebView()
+        {
+            try
+            {
+                this.Controller?.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON.COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+            catch
+            {
+                // 控制器尚未就绪时忽略
+            }
+        }
 
         private HandleRef _ParentHandle { get; set; }
 
