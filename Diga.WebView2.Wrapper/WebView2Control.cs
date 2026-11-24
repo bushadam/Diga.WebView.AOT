@@ -95,6 +95,22 @@ namespace Diga.WebView2.Wrapper
             }
         }
 
+        /// <summary>
+        /// 显示/隐藏 WebView2 内容（隐藏期间控制器与页面保持存活，只是不绘制、不接收输入）。
+        /// 多标签宿主用它切换标签：比隐藏父 HWND 安全，重新显示时不会白屏。
+        /// </summary>
+        public bool IsVisible
+        {
+            get => this.Controller != null && this.Controller.IsVisible != 0;
+            set
+            {
+                if (this.Controller != null)
+                {
+                    this.Controller.IsVisible = value ? 1 : 0;
+                }
+            }
+        }
+
         private HandleRef _ParentHandle { get; set; }
 
         public string BrowserExecutableFolder { get; }

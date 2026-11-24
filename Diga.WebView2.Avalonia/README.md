@@ -5,6 +5,7 @@ Avalonia 12 host control for `Diga.WebView2.Wrapper` (AOT version of Diga.WebVie
 - Pure managed host: no WinForms, no WPF.
 - Works with **Native AOT** (`IsAotCompatible=true`).
 - Works with the **SimdSkia** Avalonia renderer (pure managed Skia, no native `libSkiaSharp`).
+- Includes a lightweight multi-tab host (`WebViewTabHost`).
 
 ## Usage
 
@@ -22,7 +23,8 @@ AppBuilder.Configure<App>()
 var webView = new AvaloniaWebView
 {
     Source = "https://www.bing.com",
-    UserDataFolder = @"D:\Data\WebView2"   // optional
+    UserDataFolder = @"D:\Data\WebView2",   // optional
+    IgnoreCertificateErrors = true          // intranet self-signed hosts
 };
 
 webView.WebViewCreated += (_, _) => { /* ready */ };
@@ -31,10 +33,50 @@ webView.NewWindowRequested += (_, e) => { e.Handled = true; /* open in new tab *
 
 // full Diga API is always available:
 var core = webView.CoreView;                 // WebView2View (Settings / CookieManager / ExecuteScriptAsync)
+var cookies = webView.CookieManager;         // CookieManager
 await webView.ExecuteScriptAsync("document.title");
 webView.NavigateToString("<h1>hello</h1>");
 webView.ZoomFactor = 1.25;
+webView.OpenDevTools();
+webView.PrintToPdf(@"D:\tmp\page.pdf");
 ```
+
+## Features
+
+| Area | Members |
+| --- | --- |
+| Navigation | `Source`, `Navigate`, `NavigateToString`, `Reload`, `Stop`, `GoBack`, `GoForward` |
+| Script / messages | `ExecuteScriptAsync`, `PostWebMessageAsString`, `WebMessageReceived` |
+| Zoom | `ZoomFactor`, `ZoomIn`, `ZoomOut`, `ResetZoom` |
+| Debug / print | `OpenDevTools`, `AreDevToolsEnabled`, `PrintToPdf`, `PrintToPdfCompleted` |
+| Downloads | `DownloadStarting`, `OpenDefaultDownloadDialog` |
+| Windows | `NewWindowRequested`, `OpenNewWindowInSameView`, `WindowCloseRequested`, `ContainsFullScreenElementChanged` |
+| Security | `IgnoreCertificateErrors`, `ServerCertificateErrorDetected`, `AreDefaultContextMenusEnabled` |
+| Robustness | `ReloadOnProcessFailed`, `ProcessFailed`, `AcceleratorKeyPressed` (F5 / Ctrl+R / F12 / Ctrl+±0 handled by default) |
+| Diagnostics | `Trace` (static hook), `RefreshNativeBounds`, `IsWebViewReady` |
+
+## Multi-tab host
+
+```csharp
+var tabs = new WebViewTabHost();
+var first = tabs.AddTab("https://example.com");
+var second = tabs.AddTab();               // blank tab
+second.NavigateToString("<h1>hello</h1>");
+
+tabs.SelectTab(first);
+tabs.SelectNext();                        // Ctrl+Tab behaviour
+tabs.CloseSelectedTab();
+```
+
+Implementation notes:
+
+- TabControl is **not** used: it detaches non-selected content, which would destroy and recreate the
+  `CoreWebView2` (page state lost).
+- All tabs stay attached and arranged; switching uses **`ICoreWebView2Controller.IsVisible`**
+  (exposed as `WebView2Control.IsVisible`).
+- Do **not** hide the parent HWND (`ShowWindow`) or move windows in the z-order: hiding the parent makes
+  WebView2's render widget stop painting, and re-showing it leaves a blank page. This was verified
+  during development — the controller-level visibility is the only reliable way.
 
 ## Requirements (important)
 
@@ -48,7 +90,8 @@ webView.ZoomFactor = 1.25;
 ## Known limitations
 
 - **Airspace**: WebView2 is a separate HWND; Avalonia popups (Flyout / Menu / ToolTip / modal overlay)
-  cannot be drawn on top of the web area. Use a separate window or hide the webview while showing overlays.
+  cannot be drawn on top of the web area. Use a separate window, or temporarily hide the web view
+  (e.g. `Controller.IsVisible = false`) while showing overlays.
 - **Focus**: keyboard focus is forwarded on pointer press (`FocusWebView()`); Tab traversal between
   Avalonia controls and the web content has to be wired by the host application.
-- One `AvaloniaWebView` = one `CoreWebView2Controller` = one browser process group.
+- One `AvaloniaWebView` = one `CoreWebView2Controller` = one browser process group (memory cost per tab).

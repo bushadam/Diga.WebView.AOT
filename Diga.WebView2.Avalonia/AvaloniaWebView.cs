@@ -6,29 +6,42 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Platform;
+using Diga.WebView2.Interop;
 using Diga.WebView2.Wrapper;
 using Diga.WebView2.Wrapper.EventArguments;
 
 namespace Diga.WebView2.Avalonia;
 
 /// <summary>
-/// Avalonia 12 宿主控件：在 <see cref="NativeControlHost"/> 里创建 Win32 子窗口，
-/// 交给 <see cref="WebView2Control"/> 承载 WebView2。
+/// Avalonia 12 host control: creates a native Win32 child window inside a
+/// <see cref="NativeControlHost"/> and hands it to <see cref="WebView2Control"/>.
 ///
-/// 使用要求（重要）：
-/// 1. 程序必须带 app.manifest 并声明 supportedOS（Win10/11），否则 NativeControlHost 会抛
-///    "Unable to create child window for native control host"；
-/// 2. 建议声明 PerMonitorV2 DPI 感知，否则 WebView2 与 Avalonia 坐标会错位；
-/// 3. 输出目录必须包含 lib\Diga.WebView2.Native.dll。
+/// Requirements:
+/// 1. The application must ship an app.manifest declaring supportedOS (Win10/11);
+///    otherwise NativeControlHost throws "Unable to create child window for native control host".
+/// 2. Declare PerMonitorV2 DPI awareness, otherwise WebView2 and Avalonia coordinates drift apart.
+/// 3. lib\Diga.WebView2.Native.dll must be deployed next to the executable.
 ///
-/// 已知限制：WebView2 是独立 HWND，Avalonia 的弹层（Flyout/Menu/ToolTip）无法覆盖在网页区域上。
+/// Known limitation: WebView2 is a separate HWND, so Avalonia popups
+/// (Flyout / Menu / ToolTip) cannot be drawn on top of the web area.
 /// </summary>
-public class AvaloniaWebView : NativeControlHost
+public class AvaloniaWebView : NativeControlHost, IDisposable
 {
     private const int WS_CHILD = 0x40000000;
     private const int WS_VISIBLE = 0x10000000;
     private const int WS_CLIPCHILDREN = 0x02000000;
     private const int WS_CLIPSIBLINGS = 0x04000000;
+
+    private const int VK_CONTROL = 0x11;
+    private const uint VK_F5 = 0x74;
+    private const uint VK_F12 = 0x7B;
+    private const uint VK_R = 0x52;
+    private const uint VK_0 = 0x30;
+    private const uint VK_OEM_PLUS = 0xBB;
+    private const uint VK_OEM_MINUS = 0xBD;
+
+    private const int SW_HIDE = 0;
+    private const int SW_SHOW = 5;
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern nint CreateWindowEx(int exStyle, string className, string? windowName, int style,
@@ -39,6 +52,19 @@ public class AvaloniaWebView : NativeControlHost
 
     [DllImport("user32.dll")]
     private static extern nint SetFocus(nint hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(nint hwnd, int nCmdShow);
+
+    private static readonly nint HWND_TOP = IntPtr.Zero;
+    private static readonly nint HWND_BOTTOM = (IntPtr)1;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_SHOWWINDOW = 0x0040;
+
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int nVirtKey);
 
     public static readonly StyledProperty<string?> SourceProperty =
         AvaloniaProperty.Register<AvaloniaWebView, string?>(nameof(Source));
@@ -57,6 +83,7 @@ public class AvaloniaWebView : NativeControlHost
 
     private nint _childHwnd;
     private string? _pendingSource;
+    private string? _pendingHtml;
 
     static AvaloniaWebView()
     {
@@ -64,22 +91,31 @@ public class AvaloniaWebView : NativeControlHost
         ZoomFactorProperty.Changed.AddClassHandler<AvaloniaWebView>((view, args) => view.OnZoomFactorChanged(args));
     }
 
-    /// <summary>底层的 Diga WebView2 控制对象；未创建前为 null，可用于访问完整 API。</summary>
+    /// <summary>Optional diagnostics hook; receives host/tab lifecycle messages.</summary>
+    public static Action<string>? Trace { get; set; }
+
+    /// <summary>Underlying Diga control; null until the native host is created.</summary>
     public WebView2Control? WebViewControl { get; private set; }
 
-    /// <summary>WebView2 的 CoreWebView2 视图（脚本、设置、Cookie 等）。</summary>
+    /// <summary>CoreWebView2 view (script, settings, cookies...).</summary>
     public WebView2View? CoreView => WebViewControl?.WebView;
+
+    /// <summary>WebView2 settings; null until ready.</summary>
+    public WebView2Settings? Settings => CoreView?.Settings;
+
+    /// <summary>Cookie manager; null until ready.</summary>
+    public CookieManager? CookieManager => WebViewControl?.GetCookieManager;
 
     public bool IsWebViewReady => WebViewControl != null;
 
-    /// <summary>要加载的 URL；控件就绪前后赋值都可以。</summary>
+    // ---- Host configuration ----
+
     public string? Source
     {
         get => GetValue(SourceProperty);
         set => SetValue(SourceProperty, value);
     }
 
-    /// <summary>WebView2 用户数据目录；留空则使用 %LOCALAPPDATA%\Diga.WebView2.Avalonia\WebView2Data。</summary>
     public string? UserDataFolder
     {
         get => GetValue(UserDataFolderProperty);
@@ -104,7 +140,25 @@ public class AvaloniaWebView : NativeControlHost
         set => SetValue(ZoomFactorProperty, value);
     }
 
-    // ---- WebView2 事件（参数类型直接复用 Diga.WebView2.Wrapper.EventArguments）----
+    /// <summary>Enable DevTools (default true).</summary>
+    public bool AreDevToolsEnabled { get; set; } = true;
+
+    /// <summary>Enable the default WebView2 context menu (default true).</summary>
+    public bool AreDefaultContextMenusEnabled { get; set; } = true;
+
+    /// <summary>Automatically accept server certificate errors (common for intranet self-signed hosts).</summary>
+    public bool IgnoreCertificateErrors { get; set; }
+
+    /// <summary>Reload automatically when the render process fails (default true).</summary>
+    public bool ReloadOnProcessFailed { get; set; } = true;
+
+    /// <summary>Handle window.open / target=_blank by navigating the current view (default true).</summary>
+    public bool OpenNewWindowInSameView { get; set; } = true;
+
+    /// <summary>Handle F5 / Ctrl+R / F12 / Ctrl+±0 shortcuts inside the control (default true).</summary>
+    public bool HandleAcceleratorKeys { get; set; } = true;
+
+    // ---- WebView2 events ----
     public event EventHandler? WebViewCreated;
     public event EventHandler<NavigationStartingEventArgs>? NavigationStarting;
     public event EventHandler<NavigationCompletedEventArgs>? NavigationCompleted;
@@ -117,17 +171,21 @@ public class AvaloniaWebView : NativeControlHost
     public event EventHandler<WebView2EventArgs>? ContainsFullScreenElementChanged;
     public event EventHandler<WebView2EventArgs>? WindowCloseRequested;
     public event EventHandler<AcceleratorKeyPressedEventArgs>? AcceleratorKeyPressed;
+    public event EventHandler<ServerCertificateErrorDetectedEventArgs>? ServerCertificateErrorDetected;
+    public event EventHandler<ContextMenuRequestedEventArgs>? ContextMenuRequested;
+    public event EventHandler<PrintToPdfCompleteEventArgs>? PrintToPdfCompleted;
 
     public AvaloniaWebView()
     {
         Focusable = true;
     }
 
-    // ---- 导航 / 脚本 / 消息 ----
+    // ---- Navigation ----
     public void Navigate(string url)
     {
         if (WebViewControl == null)
         {
+            _pendingHtml = null;
             _pendingSource = url;
             return;
         }
@@ -135,11 +193,13 @@ public class AvaloniaWebView : NativeControlHost
         WebViewControl.Navigate(url);
     }
 
+    /// <summary>Load an HTML string; queued until the control is ready.</summary>
     public void NavigateToString(string html)
     {
         if (WebViewControl == null)
         {
-            return; // 未就绪时忽略，调用方可挂在 WebViewCreated 上
+            _pendingHtml = html;
+            return;
         }
 
         WebViewControl.NavigateToString(html);
@@ -147,22 +207,58 @@ public class AvaloniaWebView : NativeControlHost
 
     public void Reload() => WebViewControl?.Reload();
 
+    public void Stop()
+    {
+        try
+        {
+            CoreView?.Stop();
+        }
+        catch
+        {
+            // not ready
+        }
+    }
+
     public void GoBack() => WebViewControl?.GoBack();
 
     public void GoForward() => WebViewControl?.GoForward();
 
+    public void OpenDefaultDownloadDialog() => WebViewControl?.OpenDefaultDownloadDialog();
+
+    // ---- Script / messages ----
     public async Task<string?> ExecuteScriptAsync(string javaScript)
     {
         if (CoreView == null)
             return null;
 
-        var result = await CoreView.ExecuteScriptAsync(javaScript).ConfigureAwait(true);
-        return result;
+        return await CoreView.ExecuteScriptAsync(javaScript).ConfigureAwait(true);
     }
 
     public void PostWebMessageAsString(string message) => WebViewControl?.PostWebMessageAsString(message);
 
-    /// <summary>把键盘焦点交给 WebView2（宿主被点击时自动调用）。</summary>
+    // ---- Zoom / DevTools / printing ----
+    public void ZoomIn() => ZoomFactor = Math.Min(5.0, Math.Round(ZoomFactor + 0.1, 2));
+
+    public void ZoomOut() => ZoomFactor = Math.Max(0.25, Math.Round(ZoomFactor - 0.1, 2));
+
+    public void ResetZoom() => ZoomFactor = 1.0;
+
+    public void OpenDevTools()
+    {
+        try
+        {
+            CoreView?.OpenDevToolsWindow();
+        }
+        catch
+        {
+            // not ready
+        }
+    }
+
+    /// <summary>Print the current page to PDF; raises <see cref="PrintToPdfCompleted"/> when done.</summary>
+    public void PrintToPdf(string path) => CoreView?.PrintToPdf(path, null!);
+
+    /// <summary>Hand keyboard focus to WebView2 (called automatically on pointer press).</summary>
     public void FocusWebView()
     {
         if (_childHwnd != IntPtr.Zero)
@@ -170,7 +266,39 @@ public class AvaloniaWebView : NativeControlHost
         WebViewControl?.MoveFocusToWebView();
     }
 
-    // ---- 生命周期 ----
+    /// <summary>
+    /// Show/hide the native child window. Used by <see cref="WebViewTabHost"/>:
+    /// Avalonia visibility alone does not always hide the HWND.
+    /// </summary>
+    /// <summary>
+    /// 切换本视图是否显示（多标签用）。使用 WebView2 控制器的 IsVisible，
+    /// 而不是 ShowWindow/隐藏父窗口 —— 后者会让渲染控件进入隐藏状态，重新显示时白屏。
+    /// </summary>
+    internal void SetNativeVisible(bool visible)
+    {
+        try
+        {
+            if (WebViewControl != null)
+                WebViewControl.IsVisible = visible;
+        }
+        catch
+        {
+            // 控制器尚未就绪
+        }
+
+        Trace?.Invoke($"SetNativeVisible({visible}) hwnd=0x{_childHwnd.ToInt64():X} active={IsTabActive}");
+    }
+
+    /// <summary>Re-align the WebView2 controller bounds with the current parent client area.</summary>
+    public void RefreshNativeBounds()
+    {
+        // 切换标签时 Arrange 未必会再次触发，这里显式同步一次可见性与 Bounds。
+        SetNativeVisible(IsTabActive);
+        if (IsTabActive)
+            DockToParentSafe();
+    }
+
+    // ---- Lifetime ----
     protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle parent)
     {
         _childHwnd = CreateWindowEx(0, "STATIC", null,
@@ -178,7 +306,7 @@ public class AvaloniaWebView : NativeControlHost
             0, 0, 200, 200, parent.Handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
 
         if (_childHwnd == IntPtr.Zero)
-            throw new InvalidOperationException("CreateWindowEx 失败，错误码 " + Marshal.GetLastWin32Error());
+            throw new InvalidOperationException("CreateWindowEx failed, error " + Marshal.GetLastWin32Error());
 
         var options = new WebView2ControlCreateParams
         {
@@ -196,6 +324,52 @@ public class AvaloniaWebView : NativeControlHost
 
     protected override void DestroyNativeControlCore(IPlatformHandle control)
     {
+        DisposeWebView();
+        base.DestroyNativeControlCore(control);
+    }
+
+    protected override Size ArrangeOverride(Size finalSize)
+    {
+        var size = base.ArrangeOverride(finalSize);
+
+        // Avalonia 自身会在布局时把原生子窗口 Show 出来，所以“藏起来”的标签要在布局之后
+        // 再隐藏一次，否则多个标签的 HWND 会叠在一起（后加的在上）。
+        if (IsTabActive)
+        {
+            SetNativeVisible(true);
+            DockToParentSafe();
+        }
+        else
+        {
+            SetNativeVisible(false);
+        }
+
+        Trace?.Invoke($"Arrange({finalSize.Width}x{finalSize.Height}) active={IsTabActive} hwnd=0x{_childHwnd.ToInt64():X}");
+
+        return size;
+    }
+
+    /// <summary>
+    /// 是否是当前显示的标签。由 <see cref="WebViewTabHost"/> 维护：
+    /// 非活动标签在每次布局后都会被重新隐藏（Avalonia 布局会把原生窗口重新显示出来）。
+    /// </summary>
+    internal bool IsTabActive { get; set; } = true;
+
+    protected override void OnPointerPressed(PointerPressedEventArgs e)
+    {
+        base.OnPointerPressed(e);
+        FocusWebView();
+    }
+
+    /// <summary>Release WebView2 and the native child window (used when a tab is closed).</summary>
+    public void Dispose()
+    {
+        DisposeWebView();
+        GC.SuppressFinalize(this);
+    }
+
+    private void DisposeWebView()
+    {
         try
         {
             if (WebViewControl != null)
@@ -206,7 +380,7 @@ public class AvaloniaWebView : NativeControlHost
         }
         catch
         {
-            // 关闭阶段忽略
+            // shutdown path
         }
 
         WebViewControl = null;
@@ -215,29 +389,6 @@ public class AvaloniaWebView : NativeControlHost
             DestroyWindow(_childHwnd);
             _childHwnd = IntPtr.Zero;
         }
-
-        base.DestroyNativeControlCore(control);
-    }
-
-    protected override Size ArrangeOverride(Size finalSize)
-    {
-        var size = base.ArrangeOverride(finalSize);
-        try
-        {
-            WebViewControl?.DockToParent();
-        }
-        catch
-        {
-            // 未就绪时忽略
-        }
-
-        return size;
-    }
-
-    protected override void OnPointerPressed(PointerPressedEventArgs e)
-    {
-        base.OnPointerPressed(e);
-        FocusWebView();
     }
 
     private void OnSourceChanged(AvaloniaPropertyChangedEventArgs args)
@@ -248,6 +399,7 @@ public class AvaloniaWebView : NativeControlHost
 
         if (WebViewControl == null)
         {
+            _pendingHtml = null;
             _pendingSource = url;
             return;
         }
@@ -283,36 +435,56 @@ public class AvaloniaWebView : NativeControlHost
     {
         control.Created += OnCreated;
         control.NavigateStart += (_, e) => NavigationStarting?.Invoke(this, e);
-        control.NavigationCompleted += (_, e) => NavigationCompleted?.Invoke(this, e);
+        control.NavigationCompleted += OnNavigationCompleted;
         control.SourceChanged += (_, e) => SourceChanged?.Invoke(this, e);
         control.DocumentTitleChanged += (_, e) => DocumentTitleChanged?.Invoke(this, e);
-        control.NewWindowRequested += (_, e) => NewWindowRequested?.Invoke(this, e);
+        control.NewWindowRequested += OnNewWindowRequested;
         control.WebMessageReceived += (_, e) => WebMessageReceived?.Invoke(this, e);
         control.DownloadStarting += (_, e) => DownloadStarting?.Invoke(this, e);
-        control.ProcessFailed += (_, e) => ProcessFailed?.Invoke(this, e);
+        control.ProcessFailed += OnProcessFailed;
         control.ContainsFullScreenElementChanged += (_, e) => ContainsFullScreenElementChanged?.Invoke(this, e);
         control.WindowCloseRequested += (_, e) => WindowCloseRequested?.Invoke(this, e);
-        control.AcceleratorKeyPressed += (_, e) => AcceleratorKeyPressed?.Invoke(this, e);
+        control.AcceleratorKeyPressed += OnAcceleratorKeyPressed;
+        control.ServerCertificateErrorDetected += OnServerCertificateErrorDetected;
+        control.ContextMenuRequested += (_, e) => ContextMenuRequested?.Invoke(this, e);
+        control.PrintToPdfCompleted += (_, e) => PrintToPdfCompleted?.Invoke(this, e);
     }
 
     private void UnwireEvents(WebView2Control control)
     {
         control.Created -= OnCreated;
+        control.NavigationCompleted -= OnNavigationCompleted;
+        control.NewWindowRequested -= OnNewWindowRequested;
+        control.ProcessFailed -= OnProcessFailed;
+        control.AcceleratorKeyPressed -= OnAcceleratorKeyPressed;
+        control.ServerCertificateErrorDetected -= OnServerCertificateErrorDetected;
     }
 
     private void OnCreated(object? sender, EventArgs e)
     {
         try
         {
+            ApplySettings();
+
             if (ZoomFactor > 0)
                 WebViewControl!.ZoomFactor = ZoomFactor;
 
-            var target = _pendingSource;
-            if (string.IsNullOrWhiteSpace(target))
-                target = Source;
+            var html = _pendingHtml;
+            _pendingHtml = null;
 
-            if (!string.IsNullOrWhiteSpace(target))
-                WebViewControl!.Navigate(target);
+            if (!string.IsNullOrEmpty(html))
+            {
+                WebViewControl!.NavigateToString(html);
+            }
+            else
+            {
+                var target = _pendingSource;
+                if (string.IsNullOrWhiteSpace(target))
+                    target = Source;
+
+                if (!string.IsNullOrWhiteSpace(target))
+                    WebViewControl!.Navigate(target);
+            }
 
             _pendingSource = null;
             DockToParentSafe();
@@ -320,7 +492,124 @@ public class AvaloniaWebView : NativeControlHost
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine("[AvaloniaWebView] Created 回调异常: " + ex);
+            System.Diagnostics.Debug.WriteLine("[AvaloniaWebView] Created callback failed: " + ex);
+        }
+    }
+
+    private void ApplySettings()
+    {
+        var settings = Settings;
+        if (settings == null)
+            return;
+
+        settings.AreDevToolsEnabled = AreDevToolsEnabled;
+        settings.AreDefaultContextMenusEnabled = AreDefaultContextMenusEnabled;
+    }
+
+    private void OnNavigationCompleted(object? sender, NavigationCompletedEventArgs e)
+    {
+        NavigationCompleted?.Invoke(this, e);
+    }
+
+    private void OnNewWindowRequested(object? sender, NewWindowRequestedEventArgs e)
+    {
+        try
+        {
+            NewWindowRequested?.Invoke(this, e);
+
+            if (OpenNewWindowInSameView && !e.Handled)
+            {
+                e.Handled = true;
+                var uri = e.Uri;
+                if (!string.IsNullOrWhiteSpace(uri))
+                    Navigate(uri);
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine("[AvaloniaWebView] NewWindowRequested failed: " + ex);
+        }
+    }
+
+    private void OnProcessFailed(object? sender, ProcessFailedEventArgs e)
+    {
+        ProcessFailed?.Invoke(this, e);
+
+        if (ReloadOnProcessFailed && IsWebViewReady)
+        {
+            try
+            {
+                Reload();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+    }
+
+    private void OnServerCertificateErrorDetected(object? sender, ServerCertificateErrorDetectedEventArgs e)
+    {
+        ServerCertificateErrorDetected?.Invoke(this, e);
+
+        if (!IgnoreCertificateErrors)
+            return;
+
+        try
+        {
+            e.Action = COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION
+                .COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine("[AvaloniaWebView] certificate error handling failed: " + ex);
+        }
+    }
+
+    private void OnAcceleratorKeyPressed(object? sender, AcceleratorKeyPressedEventArgs e)
+    {
+        AcceleratorKeyPressed?.Invoke(this, e);
+
+        if (!HandleAcceleratorKeys || e.Handled)
+            return;
+
+        if (e.KeyEventKind != COREWEBVIEW2_KEY_EVENT_KIND.COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
+            e.KeyEventKind != COREWEBVIEW2_KEY_EVENT_KIND.COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+            return;
+
+        var ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
+        switch (e.VirtualKey)
+        {
+            case VK_F12:
+                e.Handled = true;
+                OpenDevTools();
+                break;
+
+            case VK_F5:
+                e.Handled = true;
+                Reload();
+                break;
+
+            case VK_R when ctrl:
+                e.Handled = true;
+                Reload();
+                break;
+
+            case VK_0 when ctrl:
+                e.Handled = true;
+                ResetZoom();
+                break;
+
+            case VK_OEM_PLUS when ctrl:
+                e.Handled = true;
+                ZoomIn();
+                break;
+
+            case VK_OEM_MINUS when ctrl:
+                e.Handled = true;
+                ZoomOut();
+                break;
         }
     }
 
@@ -332,7 +621,7 @@ public class AvaloniaWebView : NativeControlHost
         }
         catch
         {
-            // 忽略
+            // not ready
         }
     }
 }
