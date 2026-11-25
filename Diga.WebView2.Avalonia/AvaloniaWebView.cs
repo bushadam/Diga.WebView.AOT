@@ -173,6 +173,10 @@ public class AvaloniaWebView : NativeControlHost, IDisposable
     public event EventHandler<AcceleratorKeyPressedEventArgs>? AcceleratorKeyPressed;
     public event EventHandler<ServerCertificateErrorDetectedEventArgs>? ServerCertificateErrorDetected;
     public event EventHandler<ContextMenuRequestedEventArgs>? ContextMenuRequested;
+    public event EventHandler<WebResourceResponseReceivedEventArgs>? WebResourceResponseReceived;
+    public event EventHandler<WebResourceRequestedEventArgs>? WebResourceRequested;
+    public event EventHandler<DOMContentLoadedEventArgs>? DOMContentLoaded;
+    public event EventHandler<PermissionRequestedEventArgs>? PermissionRequested;
     public event EventHandler<PrintToPdfCompleteEventArgs>? PrintToPdfCompleted;
 
     public AvaloniaWebView()
@@ -235,6 +239,10 @@ public class AvaloniaWebView : NativeControlHost, IDisposable
     }
 
     public void PostWebMessageAsString(string message) => WebViewControl?.PostWebMessageAsString(message);
+
+    /// <summary>在文档创建时注入脚本（等价于原版的 DOMContentLoaded + ExecuteScript，但更早执行）。</summary>
+    public void AddScriptToExecuteOnDocumentCreated(string javaScript)
+        => WebViewControl?.AddScriptToExecuteOnDocumentCreated(javaScript);
 
     // ---- Zoom / DevTools / printing ----
     public void ZoomIn() => ZoomFactor = Math.Min(5.0, Math.Round(ZoomFactor + 0.1, 2));
@@ -447,6 +455,10 @@ public class AvaloniaWebView : NativeControlHost, IDisposable
         control.AcceleratorKeyPressed += OnAcceleratorKeyPressed;
         control.ServerCertificateErrorDetected += OnServerCertificateErrorDetected;
         control.ContextMenuRequested += (_, e) => ContextMenuRequested?.Invoke(this, e);
+        control.WebResourceResponseReceived += (_, e) => WebResourceResponseReceived?.Invoke(this, e);
+        control.WebResourceRequested += (_, e) => WebResourceRequested?.Invoke(this, e);
+        control.DOMContentLoaded += (_, e) => DOMContentLoaded?.Invoke(this, e);
+        control.PermissionRequested += (_, e) => PermissionRequested?.Invoke(this, e);
         control.PrintToPdfCompleted += (_, e) => PrintToPdfCompleted?.Invoke(this, e);
     }
 
